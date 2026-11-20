@@ -1,0 +1,172 @@
+----------------------------------------------SERVER------------------------------------------------
+
+"""
+server.py - Multi-client TCP + UDP server (Transport Layer demo)
+TCP : port 5000  (connection-oriented, one thread per client)
+UDP : port 5001  (connectionless, single socket serves every client)
+"""
+import socket, threading, time, random, sys
+
+HOST = "0.0.0.0"
+TCP_PORT = 5000
+UDP_PORT = 5001
+UDP_DROP = float(sys.argv[1]) if len(sys.argv) > 1 else 0.0   # simulated loss for demo
+
+def stamp():
+    return time.strftime("%H:%M:%S")
+
+def handle_tcp_client(conn, addr):
+    print(f"[{stamp()}] [TCP] Connection established with {addr[0]}:{addr[1]}")
+    try:
+        while True:
+            data = conn.recv(1024)
+            if not data:                       # client closed the connection
+                break
+            text = data.decode()
+            cid, seq, msg = text.split("|", 2)
+            print(f"[{stamp()}] [TCP] From {cid} (seq {seq}): {msg}")
+            conn.sendall(f"ACK|{cid}|{seq}|Received: {msg}".encode())
+    except ConnectionResetError:
+        print(f"[{stamp()}] [TCP] Connection reset by {addr}")
+    finally:
+        conn.close()
+        print(f"[{stamp()}] [TCP] Connection closed with {addr[0]}:{addr[1]}")
+
+def tcp_server():
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((HOST, TCP_PORT))
+    s.listen(5)
+    print(f"[{stamp()}] TCP server listening on port {TCP_PORT}")
+    while True:
+        conn, addr = s.accept()                # three-way handshake completes here
+        threading.Thread(target=handle_tcp_client, args=(conn, addr), daemon=True).start()
+
+def udp_server():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind((HOST, UDP_PORT))
+    print(f"[{stamp()}] UDP server listening on port {UDP_PORT} (simulated drop rate {UDP_DROP:.0%})")
+    while True:
+        data, addr = s.recvfrom(2048)
+        if random.random() < UDP_DROP:         # pretend the network lost this datagram
+            continue
+        cid, seq, msg = data.decode().split("|", 2)
+        print(f"[{stamp()}] [UDP] From {cid} @ {addr[0]}:{addr[1]} (seq {seq}): {msg}")
+        s.sendto(f"ACK|{cid}|{seq}|Received: {msg}".encode(), addr)
+
+if __name__ == "__main__":
+    threading.Thread(target=tcp_server, daemon=True).start()
+    threading.Thread(target=udp_server, daemon=True).start()
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nServer stopped.")
+
+
+--------------------------------------------CLIENT------------------------------------------------
+
+"""
+client.py - TCP / UDP client
+Usage: python client.py CLIENT_ID SERVER_IP PROTOCOL "message" [COUNT]
+"""
+import socket, sys, time
+
+TCP_PORT, UDP_PORT = 5000, 5001
+
+def run(client_id, ip, proto, message, count=1):
+    proto = proto.upper()
+    port = TCP_PORT if proto == "TCP" else UDP_PORT
+    print("=" * 52)
+    print(f" Client ID       : {client_id}")
+    print(f" Server IP       : {ip}")
+    print(f" Port Number     : {port}")
+    print(f" Protocol        : {proto}")
+    print("=" * 52)
+
+    if proto == "TCP":
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        t0 = time.perf_counter()
+        try:
+            s.connect((ip, port))
+        except OSError as e:
+            print(" Connection Status: FAILED -", e); return
+        print(f" Connection Status: ESTABLISHED (handshake {(time.perf_counter()-t0)*1000:.3f} ms)")
+    else:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(1.0)
+        print(" Connection Status: CONNECTIONLESS (no handshake)")
+
+    for seq in range(1, count + 1):
+        packet = f"{client_id}|{seq}|{message}".encode()
+        print(f"\n Message Input        : {message}  (seq {seq})")
+        t1 = time.perf_counter()
+        try:
+            if proto == "TCP":
+                s.sendall(packet)
+                reply = s.recv(1024)
+            else:
+                s.sendto(packet, (ip, port))
+                reply, _ = s.recvfrom(2048)
+            ms = (time.perf_counter() - t1) * 1000
+            _, _, rseq, body = reply.decode().split("|", 3)
+            print(f" Message Received     : {body}")
+            print(f" Acknowledgment Status: ACK received for seq {rseq}")
+            print(f" Packet Transmission  : {ms:.3f} ms")
+        except socket.timeout:
+            print(" Message Received     : -")
+            print(" Acknowledgment Status: NO ACK (datagram lost / timed out)")
+            print(" Packet Transmission  : timeout > 1000 ms")
+    s.close()
+    print(" Connection Status: CLOSED\n")
+
+if __name__ == "__main__":
+    if len(sys.argv) < 5:
+        print(__doc__); sys.exit(1)
+    cnt = int(sys.argv[5]) if len(sys.argv) > 5 else 1
+    run(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], cnt)
+
+
+-------------------------------------------------BENCHMARK------------------------------------------------------------
+
+"""benchmark.py - measures TCP vs UDP round-trip time, throughput and loss."""
+import socket, time, statistics, sys
+
+IP, N = "127.0.0.1", 200
+
+def tcp_test(size):
+    msg = "x" * size
+    t0 = time.perf_counter()
+    s = socket.socket(); s.connect((IP, 5000))
+    setup = (time.perf_counter() - t0) * 1000
+    rtts, ok = [], 0
+    for i in range(N):
+        t = time.perf_counter()
+        s.sendall(f"bench|{i}|{msg}".encode())
+        r = s.recv(2048)
+        rtts.append((time.perf_counter() - t) * 1000); ok += 1
+    s.close()
+    return setup, rtts, ok
+
+def udp_test(size):
+    msg = "x" * size
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(0.05)
+    rtts, ok = [], 0
+    for i in range(N):
+        t = time.perf_counter()
+        s.sendto(f"bench|{i}|{msg}".encode(), (IP, 5001))
+        try:
+            s.recvfrom(2048)
+            rtts.append((time.perf_counter() - t) * 1000); ok += 1
+        except socket.timeout:
+            pass
+    s.close()
+    return 0.0, rtts, ok
+
+print(f"{'Proto':<6}{'Payload':>8}{'Setup ms':>10}{'Avg ms':>9}{'Min ms':>9}{'Max ms':>9}{'Delivered':>11}{'Loss %':>8}")
+for size in (64, 512):
+    for name, fn in (("TCP", tcp_test), ("UDP", udp_test)):
+        setup, rtts, ok = fn(size)
+        print(f"{name:<6}{size:>8}{setup:>10.3f}{statistics.mean(rtts):>9.3f}{min(rtts):>9.3f}{max(rtts):>9.3f}{ok:>6}/{N:<4}{(N-ok)/N*100:>8.1f}")
+
+
